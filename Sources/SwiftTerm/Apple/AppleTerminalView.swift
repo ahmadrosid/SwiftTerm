@@ -4299,20 +4299,26 @@ extension TerminalView {
 #if os(iOS) || os(visionOS)
         resetManualScrollOffsetWithinRow()
 #endif
-        let didScroll = withTerminal { terminal in
-            let displayBuffer = terminal.displayBuffer
-            let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
-            let targetRow = max(0, min(row, maxScrollback))
-            updateUserScrollingStateLocked(for: targetRow, in: displayBuffer)
-            if targetRow == displayBuffer.yDisp {
-                return false
-            }
-            terminal.setViewYDisp (targetRow)
-            
-            // tell the terminal we want to refresh all the rows
-            terminal.refresh (startRow: 0, endRow: terminal.rows)
-            return true
+        let didScroll = withTerminal { _ in
+            scrollToLocked(row: row)
         }
+        finishScroll(didScroll: didScroll, notifyAccessibility: notifyAccessibility)
+    }
+
+    // Shared with drag-selection so viewport and selection advance atomically.
+    func scrollToLocked(row: Int) -> Bool {
+        terminal.terminalLock.preconditionLocked()
+        let displayBuffer = terminal.displayBuffer
+        let maxScrollback = max(0, displayBuffer.lines.count - displayBuffer.rows)
+        let targetRow = max(0, min(row, maxScrollback))
+        updateUserScrollingStateLocked(for: targetRow, in: displayBuffer)
+        guard targetRow != displayBuffer.yDisp else { return false }
+        terminal.setViewYDisp(targetRow)
+        terminal.refresh(startRow: 0, endRow: terminal.rows)
+        return true
+    }
+
+    func finishScroll(didScroll: Bool, notifyAccessibility: Bool = true) {
         if didScroll {
             setAccessibilityNotificationForNextFrame(notifyAccessibility)
             frameDriver.markDirty()

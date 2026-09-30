@@ -975,7 +975,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             stopRenderLoop()
 #endif
             stopWindowMouseMovedFallback()
-            stopSelectionAutoScrollTimer()
+            cancelSelectionDrag()
             stopFocusNotifications()
             stopTextBlinking()
         } else {
@@ -1117,7 +1117,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             useMetalRenderer = false
         }
 #endif
-        stopSelectionAutoScrollTimer()
+        cancelSelectionDrag()
         stopWindowMouseMovedFallback()
         stopFocusNotifications()
         stopTextBlinking()
@@ -3467,6 +3467,21 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     
     private var autoScrollDelta = 0
     private var selectionAutoScrollTimer: Timer?
+    private struct SelectionDragAnchor {
+        let buffer: Buffer
+        let line: BufferLine
+        let generation: UInt64
+        let col: Int
+        let cols: Int
+        let rows: Int
+        let startsSelection: Bool
+    }
+    private var selectionDragAnchor: SelectionDragAnchor?
+    // Test seam: synthetic NSEvents do not change AppKit's physical button state.
+    var selectionDragInput: () -> (buttons: Int, modifiers: NSEvent.ModifierFlags) = {
+        (NSEvent.pressedMouseButtons, NSEvent.modifierFlags)
+    }
+    var selectionAutoScrollActive: Bool { selectionAutoScrollTimer != nil }
     private var previousPressureStage = 0
     private var forceClickHandledForCurrentPress = false
     var forceClickEnabledProvider: () -> Bool = {
@@ -3499,26 +3514,50 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     private func stopSelectionAutoScrollTimer() {
         selectionAutoScrollTimer?.invalidate()
         selectionAutoScrollTimer = nil
+        autoScrollDelta = 0
+        lastSelectionDragPoint = nil
+    }
+
+    private func cancelSelectionDrag() {
+        stopSelectionAutoScrollTimer()
+        selectionDragAnchor = nil
+    }
+
+    private func selectionDragIsValidLocked() -> Bool {
+        terminal.terminalLock.preconditionLocked()
+        guard let anchor = selectionDragAnchor else { return false }
+        return anchor.buffer === terminal.displayBuffer &&
+            anchor.cols == terminal.cols && anchor.rows == terminal.rows
     }
 
     // Callback from the selection auto-scroll timer: advance the viewport while
     // the pointer is held past an edge, and grow the selection to match.
     @MainActor
-    private func scrollingTimerElapsed ()
+    func scrollingTimerElapsed ()
     {
-        if autoScrollDelta == 0 {
+        let input = selectionDragInput()
+        guard autoScrollDelta != 0, let point = lastSelectionDragPoint,
+              input.buttons & 1 != 0, window != nil, !isHiddenOrHasHiddenAncestor,
+              uiShutdownState == .active else {
+            cancelSelectionDrag()
             return
         }
-        if autoScrollDelta < 0 {
-            scrollUp(lines: autoScrollDelta * -1)
-        } else {
-            scrollDown(lines: autoScrollDelta)
+        let didScroll = withTerminal { terminal -> Bool? in
+            let bypass = input.modifiers.contains(.shift) && !terminal.mouseShiftCapture
+            guard selectionDragIsValidLocked(), didSelectionDrag, selection.active,
+                  !allowMouseReporting || terminal.mouseMode == .off || bypass else {
+                return nil
+            }
+            let changed = scrollToLocked(row: terminal.displayBuffer.yDisp + autoScrollDelta)
+            let hit = calculateMouseHitLocked(at: point).grid
+            selection.dragExtend(bufferPosition: hit)
+            return changed
         }
-        // Extend the selection to the pointer's position under the new viewport.
-        if selection.active, let point = lastSelectionDragPoint {
-            let hit = calculateMouseHit(at: point).grid
-            selection.dragExtend(bufferPosition: Position(col: hit.col, row: hit.row))
+        guard let didScroll else {
+            cancelSelectionDrag()
+            return
         }
+        finishScroll(didScroll: didScroll)
         setNeedsDisplay(bounds)
     }
     
@@ -3560,6 +3599,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
 
     open override func mouseDown(with event: NSEvent) {
+        cancelSelectionDrag()
         pendingSemanticClick?.cancel()
         pendingSemanticClick = nil
         didSelectionDrag = false
@@ -3595,6 +3635,12 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             default:
                 selection.select(row: hit.row)
             }
+            let buffer = terminal.displayBuffer
+            let line = buffer.lines[hit.row]
+            selectionDragAnchor = SelectionDragAnchor(
+                buffer: buffer, line: line, generation: line.recycleGeneration,
+                col: hit.col, cols: terminal.cols, rows: terminal.rows,
+                startsSelection: !selection.active)
             return false
         }
         if shouldSendButtonPress {
@@ -3624,9 +3670,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
                 terminal.endPrimaryPointerPress()
             }
         }
-        stopSelectionAutoScrollTimer()
-        autoScrollDelta = 0
-        lastSelectionDragPoint = nil
+        cancelSelectionDrag()
         let hit = calculateMouseHit(with: event).grid
         updateHoverLink(at: hit, commandOverride: commandActive || event.modifierFlags.contains(.command))
         if !forceClickHandledForCurrentPress,
@@ -3696,47 +3740,50 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
     }
     
     open override func mouseDragged(with event: NSEvent) {
-        let dragInfo = withTerminal { terminal -> (hit: Position, displayYDisp: Int, displayRows: Int, handled: Bool) in
+        let point = convert(event.locationInWindow, from: nil)
+        let selected = withTerminal { terminal -> Bool in
             let displayBuffer = terminal.displayBuffer
-            let mouseHit = calculateMouseHitLocked(at: convert(event.locationInWindow, from: nil))
+            let mouseHit = calculateMouseHitLocked(at: point)
             let hit = mouseHit.grid
             if allowMouseReporting && !shiftBypassesMouseReportingLocked(for: event) {
                 if terminal.mouseMode.sendButtonTracking() {
                     let flags = encodeMouseEventLocked(with: event)
                     let screenRow = max (0, min (displayBuffer.rows - 1, hit.row - displayBuffer.yDisp))
                     terminal.sendMotion(buttonFlags: flags, x: hit.col, y: screenRow, pixelX: mouseHit.pixels.col, pixelY: mouseHit.pixels.row)
-                    return (hit, displayBuffer.yDisp, displayBuffer.rows, true)
+                    return false
                 }
                 if terminal.mouseMode != .off {
-                    return (hit, displayBuffer.yDisp, displayBuffer.rows, true)
+                    return false
                 }
             }
-
-            if selection.active {
-                selection.dragExtend(bufferPosition: Position(col: hit.col, row: hit.row))
-            } else {
-                selection.setSoftStart(bufferPosition: Position(col: hit.col, row: hit.row))
+            guard selectionDragIsValidLocked(), let anchor = selectionDragAnchor else { return false }
+            if !selection.active {
+                // ponytail: one history scan per drag; index line identities only if profiling warrants it.
+                guard anchor.startsSelection, !didSelectionDrag,
+                      anchor.line.recycleGeneration == anchor.generation,
+                      let row = displayBuffer.absoluteRow(of: anchor.line) else { return false }
+                selection.setSoftStart(bufferPosition: Position(col: anchor.col, row: row))
                 selection.startSelection()
             }
-            return (hit, displayBuffer.yDisp, displayBuffer.rows, false)
+            selection.dragExtend(bufferPosition: hit)
+            return true
         }
-        if dragInfo.handled {
+        // Even a canceled/reported drag must not become a link click on mouse-up.
+        didSelectionDrag = true
+        guard selected else {
+            cancelSelectionDrag()
             return
         }
-        didSelectionDrag = true
-        lastSelectionDragPoint = convert(event.locationInWindow, from: nil)
         autoScrollDelta = 0
-        let screenRow = dragInfo.hit.row - dragInfo.displayYDisp
-        if withTerminal({ _ in selection.active }) {
-            if screenRow <= 0 {
-                autoScrollDelta = calcScrollingVelocity(delta: screenRow * -1) * -1
-            } else if screenRow >= dragInfo.displayRows {
-                autoScrollDelta = calcScrollingVelocity(delta: screenRow - dragInfo.displayRows)
-            }
+        if point.y > bounds.maxY {
+            autoScrollDelta = -calcScrollingVelocity(delta: Int((point.y - bounds.maxY) / cellDimension.height))
+        } else if point.y < bounds.minY {
+            autoScrollDelta = calcScrollingVelocity(delta: Int((bounds.minY - point.y) / cellDimension.height))
         }
         // Keep auto-scrolling while the pointer is held past an edge; the mouse
         // stops emitting drag events once it stops moving, so a timer drives it.
         if autoScrollDelta != 0 {
+            lastSelectionDragPoint = point
             startSelectionAutoScrollTimer()
         } else {
             stopSelectionAutoScrollTimer()
@@ -3762,9 +3809,7 @@ open class TerminalView: NSView, NSUserInterfaceValidations, TerminalDelegate {
             selection.selectWordOrExpression(at: pressLocation, in: terminal.displayBuffer)
         }
         didSelectionDrag = false
-        stopSelectionAutoScrollTimer()
-        autoScrollDelta = 0
-        lastSelectionDragPoint = nil
+        cancelSelectionDrag()
         forceClickHandledForCurrentPress = true
         setNeedsDisplay(bounds)
 
